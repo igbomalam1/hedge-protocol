@@ -79,7 +79,7 @@ const featuredWalletIds = [
 
 const initializeModal = () => {
     if (modalInstance) return modalInstance;
-    if (typeof window === 'undefined') return null;
+    // if (typeof window === 'undefined') return null; // Allow SSR initialization
 
     try {
         console.log("📡 [W3M] Initializing Modal with Project ID:", projectId.slice(0, 6) + "...");

